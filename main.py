@@ -4,6 +4,7 @@ import csv
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -26,18 +27,12 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QGridLayout,
-    QCheckBox,
-    QDialog,
-    QDialogButtonBox,
     QListWidget,
     QListWidgetItem,
     QProgressDialog,
-    QTableView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -51,11 +46,15 @@ from PySide6.QtWidgets import (
     QHeaderView,
 )
 
-from drivelens.models import Category
+from drivelens.classifier import classify
+from drivelens.models import Category, ItemKind
 from drivelens.recycle_bin import move_to_recycle_bin
 from drivelens.scanner import ScanWorker
 from drivelens.store import MAX_VISIBLE_ROWS, ScanStore
-from drivelens.windows_info import inspect_file
+from drivelens.windows_info import (
+    check_currently_used,
+    inspect_file,
+)
 
 
 # ============================================================
@@ -73,6 +72,662 @@ def format_size(value: int) -> str:
         value /= 1024
 
     return f"{value:.1f} TB"
+
+
+class SmartCleanupWorker(QObject):
+    """Move selected files to the Recycle Bin without blocking the GUI thread."""
+
+    progress = Signal(int, int, str)
+    finished = Signal(int, int, int, int, object)
+    error = Signal(str)
+
+    def __init__(self, items):
+        super().__init__()
+        self.items = list(items)
+        self.cancel_requested = False
+
+    def cancel(self):
+        self.cancel_requested = True
+
+    def run(self):
+        moved = 0
+        skipped = 0
+        failed = 0
+        freed = 0
+        moved_ids = []
+        total = len(self.items)
+
+        try:
+            for index, item in enumerate(self.items, start=1):
+                path = item.get("path", "")
+                self.progress.emit(index, total, path)
+
+                if self.cancel_requested:
+                    skipped += total - index + 1
+                    break
+
+                # Repeat every safety check immediately before the move.
+                if item.get("is_protected", 0):
+                    skipped += 1
+                    continue
+                if item.get("can_delete") != "YES":
+                    skipped += 1
+                    continue
+                if item.get("kind") != "File":
+                    skipped += 1
+                    continue
+                if not os.path.isfile(path):
+                    skipped += 1
+                    continue
+
+                try:
+                    move_to_recycle_bin(path)
+                except Exception:
+                    failed += 1
+                    continue
+
+                moved += 1
+                moved_ids.append(int(item["id"]))
+                freed += int(item.get("size", 0) or 0)
+
+            self.finished.emit(
+                moved,
+                skipped,
+                failed,
+                freed,
+                moved_ids,
+            )
+        except Exception as error:
+            self.error.emit(str(error))
+
+
+class QuickCleanupWorker(QObject):
+    """Fast, isolated cleanup for explicitly allowed temp/cache roots."""
+
+    progress = Signal(str)
+    counts = Signal(int, int, int, int, int, int)
+    finished = Signal(int, int, int, int, int, int)
+    error = Signal(str)
+    root_stats = Signal(str)
+    diagnostic = Signal(str)
+
+    _SAFE_EXTENSIONS = {
+        ".tmp", ".temp", ".cache", ".log", ".dmp",
+        ".crash", ".etl", ".bak", ".old", ".chk",
+    }
+    _UNSAFE_EXTENSIONS = {
+        ".exe", ".com", ".dll", ".sys", ".msi",
+        ".bat", ".cmd", ".ps1", ".vbs", ".js",
+        ".jse", ".scr",
+    }
+    _CACHE_DIRECTORY_NAMES = {
+        "cache", "code cache", "shadercache", "shader cache",
+        "crashdumps", "crash dumps", "crashpad",
+        "webcache", "webdata", "gputemp", "gpucache",
+        ".cache", "caches", "cache_data", "cachestorage",
+        "cacheddata", "cachedata", "chromium cache", "gpu cache",
+        "temp", "tmp",
+    }
+    _DANGEROUS_MARKERS = (
+        "\\system32\\",
+        "\\syswow64\\",
+        "\\winsxs\\",
+        "\\servicing\\",
+        "\\boot\\",
+        "\\efi\\",
+        "\\system volume information\\",
+        "\\$recycle.bin\\",
+        "\\windows\\temp\\system32\\",
+    )
+
+    _TEMP_MARKERS = (
+        r"\temp",
+        r"\appdata\local\temp",
+        r"\cache",
+        r"\code cache",
+        r"\shadercache",
+        r"\crashdumps",
+    )
+
+    # Root discovery mirrors drivelens.classifier.TEMP_MARKERS: any directory
+    # whose own name starts with 'temp', 'cache', 'code cache',
+    # 'shadercache'/'shader cache', or 'crashdump'('s') is a cleanable root.
+    # 'templates' is explicitly excluded even though the classifier would flag
+    # it; Document/theme templates are not safe to delete.
+    @staticmethod
+    def _is_cache_root_name(name: str, skip_temp: bool = False) -> bool:
+        name = (name or "").lower().strip()
+        if not name:
+            return False
+        if name.startswith("template"):
+            return False
+        if not skip_temp and name == "tmp":
+            return True
+        if not skip_temp and name.startswith("temp"):
+            return True
+        if name.startswith("cache"):
+            return True
+        if name.startswith("code cache"):
+            return True
+        if name.startswith("shadercache") or name.startswith("shader cache"):
+            return True
+        if name.startswith("crashdump"):
+            return True
+        return name in (
+            "crashpad", "crash pads", "gputemp", "gpucache", "gpu cache",
+            "webcache", "webdata", ".cache", "d3dscache",
+        )
+
+    def __init__(self):
+        super().__init__()
+        self.cancel_requested = False
+        self.current_path = ""
+        self.scanned = 0
+        self.found = 0
+        self.cleaned = 0
+        self.skipped = 0
+        self.failed = 0
+        self.freed = 0
+        self.classifier_temp_files = 0
+        self.candidate_size = 0
+        self._collect_classifier_stats = False
+        self._last_signal = 0.0
+        self.allowed_roots = ()
+
+    def cancel(self):
+        self.cancel_requested = True
+
+    def _add_root(self, roots, seen, candidate):
+        if not candidate:
+            return
+        try:
+            root = os.path.normcase(
+                os.path.abspath(candidate)
+            ).rstrip("\\")
+            if root in seen or not os.path.isdir(root):
+                return
+            seen.add(root)
+            roots.append(root)
+        except OSError:
+            return
+
+    def _find_allowed_roots(self):
+        roots = []
+        seen = set()
+
+        # Base temp directories from the environment.
+        candidates = [
+            os.environ.get("TEMP"),
+            os.environ.get("TMP"),
+            tempfile.gettempdir(),
+        ]
+        windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+        if windir:
+            candidates.append(os.path.join(windir, "Temp"))
+
+        for candidate in candidates:
+            self._add_root(roots, seen, candidate)
+
+        # The current user's app-data trees (Local, Roaming, LocalLow) plus
+        # ProgramData. Discovery mirrors the full scanner's TEMP_MARKERS so the
+        # quick cleaner reaches the same cache/temp directories the full scan
+        # classifies as Temporary/cache.
+        local_app = os.environ.get("LOCALAPPDATA")
+        user_roaming = os.environ.get("APPDATA")
+        program_data = os.environ.get("PROGRAMDATA")
+        low_app = (
+            os.path.join(os.path.dirname(local_app), "LocalLow")
+            if local_app else None
+        )
+        for base in (local_app, user_roaming, low_app, program_data):
+            self._discover_cache_roots(base, roots, seen)
+
+        # Other user profiles: their caches are invisible to env vars but the
+        # full-drive scan still classifies them as Temporary/cache.
+        system_drive = (
+            os.environ.get("SystemDrive")
+            or (os.path.splitdrive(tempfile.gettempdir())[0] + "\\")
+        )
+        if system_drive:
+            users_dir = os.path.join(system_drive, "Users")
+            current_user = (os.environ.get("USERNAME") or "").lower()
+            try:
+                for entry in os.scandir(users_dir):
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if (entry.name or "").lower() == current_user:
+                        continue
+                    profile = entry.path
+                    for tree in (
+                        os.path.join(profile, "AppData", "Local"),
+                        os.path.join(profile, "AppData", "Roaming"),
+                        os.path.join(profile, "AppData", "LocalLow"),
+                    ):
+                        self._discover_cache_roots(tree, roots, seen)
+            except OSError:
+                pass
+
+            # Drive-root-level cache/temp directories (C:\temp, C:\Cache...).
+            # Only exact temp/tmp/cache names are auto-added at the drive root
+            # to keep the quick cleaner conservative at that level.
+            try:
+                for entry in os.scandir(system_drive):
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    name = (entry.name or "").lower()
+                    if name not in ("temp", "tmp", "cache", "caches"):
+                        continue
+                    self._add_root(roots, seen, entry.path)
+            except OSError:
+                pass
+
+            # Leftover OS-upgrade data (Windows.old) the full scanner flags as
+            # Temporary/cache; bounded walk so it stays fast.
+            windows_old = os.path.join(system_drive, "Windows.old")
+            if os.path.isdir(windows_old):
+                self._discover_cache_roots(
+                    windows_old, roots, seen, depth_limit=4
+                )
+
+        # Known user-profile caches the full scanner also flags. Kept explicit
+        # because they sit inside pruned or deeply-nested directories.
+        user_profile = os.environ.get("USERPROFILE")
+        if user_profile:
+            for profile_cache in (
+                os.path.join(user_profile, ".cache"),
+                os.path.join(user_profile, ".bun", "install", "cache"),
+                os.path.join(user_profile, ".nuget", "packages"),
+                os.path.join(user_profile, ".gradle", "caches"),
+                os.path.join(user_profile, ".npm", "_cacache"),
+                os.path.join(user_profile, ".yarn", "cache"),
+                os.path.join(user_profile, ".pip", "cache"),
+            ):
+                self._add_root(roots, seen, profile_cache)
+            self._add_root(
+                roots, seen,
+                os.path.join(user_profile, "AppData", "Local", "CrashDumps"),
+            )
+            self._add_root(
+                roots, seen,
+                os.path.join(user_profile, "AppData", "Local", "D3DSCache"),
+            )
+
+        # Known browser-specific cache roots that are large and safe to clean.
+        if local_app:
+            for browser_sub in (
+                os.path.join("Google", "Chrome", "User Data"),
+                os.path.join("Microsoft", "Edge", "User Data"),
+                os.path.join("BraveSoftware", "Brave-Browser", "User Data"),
+                os.path.join("Vivaldi", "User Data"),
+                os.path.join("Opera Software", "Opera Stable"),
+                os.path.join("Yandex", "YandexBrowser", "User Data"),
+            ):
+                browser_base = os.path.join(local_app, browser_sub)
+                if os.path.isdir(browser_base):
+                    self._discover_cache_roots(browser_base, roots, seen)
+
+        # ProgramData browser and app caches.
+        if program_data:
+            self._discover_cache_roots(
+                os.path.join(program_data, "Microsoft", "Windows", "Cache"),
+                roots, seen,
+            )
+
+        # Installed-program caches (cache/code cache/etc. under Program Files).
+        # 'temp' folders are skipped there to stay conservative, and the walk
+        # is bounded. This mirrors what the full scanner classifies as
+        # Temporary under installed-application trees.
+        for pf in (
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("ProgramW6432"),
+        ):
+            if pf:
+                self._discover_cache_roots(
+                    pf, roots, seen, depth_limit=4, skip_temp=True
+                )
+
+        return tuple(roots)
+
+    def _discover_cache_roots(self, base, roots, seen,
+                              depth_limit: int = 8,
+                              skip_temp: bool = False):
+        """Walk a base dir (bounded/pruned) adding the top of each directory
+        whose own name matches the full scanner's cache/temp markers as a
+        cleanable root. Mirrors drivelens.classifier.TEMP_MARKERS so the quick
+        cleaner covers the same locations as the full-drive scan."""
+        if not base or not os.path.isdir(base):
+            return
+
+        base_len = len(base)
+        base_norm = os.path.normcase(base)
+
+        # Bulk/system directories that never hold cleanable caches.
+        # NOTE: "packages", "pnpm", "programs" are NOT pruned because they
+        # contain legitimate caches (npm, pip, yarn, etc.) that the full
+        # scanner classifies as Temporary/cache.
+        prune = {
+            "isolatedstorage", "application data", "virtualstore",
+            "winsxs", "system32", "syswow64", "servicing", "assembly",
+            "installer", "driverstore", "microsoft.net",
+            "windowsapps", "modifiablewindowsapps",
+        }
+
+        for dirpath, dirnames, filenames in os.walk(base):
+            if dirpath != base_norm:
+                folder_name = os.path.basename(dirpath).lower()
+                if self._is_cache_root_name(
+                    folder_name, skip_temp=skip_temp
+                ):
+                    self._add_root(roots, seen, dirpath)
+                    # The whole tree below a matching dir is that root.
+                    dirnames[:] = []
+                    continue
+
+            depth = dirpath[base_len:].count(os.sep)
+            if depth >= depth_limit:
+                dirnames[:] = []
+                continue
+
+            dirnames[:] = [
+                dname for dname in dirnames
+                if dname.lower() not in prune
+            ]
+
+    def _diag_write(self, message):
+        """Temporary diagnostic helper: append to a log file and emit."""
+        try:
+            log_path = os.path.join(
+                tempfile.gettempdir(),
+                "drivelens-quick-cleanup-diag.log",
+            )
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write(message + "\n")
+        except OSError:
+            pass
+        self.diagnostic.emit(message)
+
+    def _log_roots(self):
+        """Diagnostic output listing quick cleanup roots."""
+        lines = ["Quick Cleanup roots:"]
+        for i, root in enumerate(self.allowed_roots, start=1):
+            lines.append(f"  path {i}: {root}")
+        lines.append(f"\nTotal roots: {len(self.allowed_roots)}")
+        self._diag_write("\n".join(lines))
+
+    def _report_root_done(self, root, examined, candidates, size,
+                          classifier_temp):
+        msg = (
+            f"Root: {root}\n"
+            f"  files examined: {examined:,}\n"
+            f"  cache/temp candidates found: {candidates:,}\n"
+            f"  total candidate size: {format_size(size)}\n"
+            f"  full-scanner TEMPORARY files in root: {classifier_temp:,}"
+        )
+        self.root_stats.emit(msg)
+        self._diag_write(msg)
+
+    def _normalise(self, path):
+        # scandir() paths are already absolute; avoid realpath/abspath here
+        # (expensive per-file syscalls) for the cleanup hot path.
+        return os.path.normcase(path).replace("/", "\\").rstrip("\\")
+
+    def _is_allowed_path(self, path):
+        try:
+            normal = self._normalise(path)
+            for root in self.allowed_roots:
+                if normal == root or normal.startswith(root + "\\"):
+                    return True
+            return False
+        except OSError:
+            return False
+
+    def _is_reparse_point(self, entry):
+        try:
+            attributes = entry.stat(
+                follow_symlinks=False
+            ).st_file_attributes
+            return bool(attributes & 0x400) or entry.is_symlink()
+        except (AttributeError, OSError):
+            return entry.is_symlink()
+
+    def _is_dangerous_path(self, path):
+        normal = self._normalise(path)
+        return any(
+            marker in normal
+            for marker in self._DANGEROUS_MARKERS
+        )
+
+    def _is_safe_candidate(self, path):
+        if not self._is_allowed_path(path):
+            return False
+        if self._is_dangerous_path(path):
+            return False
+
+        name = os.path.basename(path).lower()
+        extension = os.path.splitext(name)[1]
+        if extension in self._UNSAFE_EXTENSIONS:
+            return False
+
+        normal = self._normalise(path)
+
+        # Match the classifier's TEMP_MARKERS logic.
+        if any(marker in normal for marker in self._TEMP_MARKERS):
+            return True
+
+        components = {c for c in normal.split("\\")}
+
+        # Files in any cache/temp directory name are candidates.
+        if bool(components & self._CACHE_DIRECTORY_NAMES):
+            return True
+
+        # Files with clearly temporary/regenerable extension.
+        return extension in self._SAFE_EXTENSIONS
+
+    def _emit_update(self, force=False):
+        now = time.monotonic()
+        if not force and now - self._last_signal < 0.08:
+            return
+        self._last_signal = now
+        self.progress.emit(self.current_path)
+        self.counts.emit(
+            self.scanned,
+            self.found,
+            self.cleaned,
+            self.skipped,
+            self.failed,
+            self.freed,
+        )
+
+    def _scan_directory(self, root):
+        examined = 0
+        candidates = 0
+        candidate_size = 0
+        classifier_temp = 0
+        stack = [root]
+        while stack and not self.cancel_requested:
+            directory = stack.pop()
+            try:
+                entries = os.scandir(directory)
+            except OSError:
+                self.skipped += 1
+                continue
+
+            with entries:
+                for entry in entries:
+                    if self.cancel_requested:
+                        return
+
+                    self.current_path = entry.path
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if not self._is_reparse_point(entry):
+                                stack.append(entry.path)
+                            continue
+
+                        if not entry.is_file(follow_symlinks=False):
+                            self.skipped += 1
+                            continue
+
+                        self.scanned += 1
+                        examined += 1
+
+                        # Cross-check against the full scanner's classifier so
+                        # quick-cleanup coverage can be compared with the
+                        # full-drive TEMPORARY/cache totals.
+                        if self._collect_classifier_stats:
+                            try:
+                                cls = classify(entry.path, ItemKind.FILE, 0)
+                                if cls.category == Category.TEMPORARY:
+                                    self.classifier_temp_files += 1
+                                    classifier_temp += 1
+                            except Exception:
+                                pass
+
+                        if not self._is_safe_candidate(entry.path):
+                            self.skipped += 1
+                            continue
+
+                        self.found += 1
+                        candidates += 1
+                        path = entry.path
+
+                        try:
+                            size = int(
+                                entry.stat(
+                                    follow_symlinks=False
+                                ).st_size
+                            )
+                        except (OSError, ValueError):
+                            size = 0
+                        candidate_size += size
+                        self.candidate_size += size
+
+                        # Final checks happen immediately before moving.
+                        if (
+                            not self._is_allowed_path(path)
+                            or self._is_dangerous_path(path)
+                            or not os.path.isfile(path)
+                            or check_currently_used(path) != "NO"
+                        ):
+                            self.skipped += 1
+                            self._emit_update()
+                            continue
+
+                        try:
+                            move_to_recycle_bin(path)
+                            self.cleaned += 1
+                            self.freed += size
+                        except Exception:
+                            self.failed += 1
+
+                        self._emit_update()
+                    except (OSError, ValueError):
+                        self.skipped += 1
+                        self._emit_update()
+
+        self._report_root_done(
+            root, examined, candidates, candidate_size, classifier_temp
+        )
+
+    def _diagnose_full_scan(self):
+        """Best-effort comparison against the classifier's full-drive results.
+
+        Reads the temporary SQLite database left behind by the most recent
+        full C: scan (MainWindow.database_path) and reports which paths it
+        classified as Temporary/cache, so the quick cleaner can be validated
+        against the ~15 GB total the full scan reports."""
+        db_path = os.path.join(
+            tempfile.gettempdir(),
+            "drivelens-current.sqlite3",
+        )
+        if not os.path.exists(db_path):
+            self._diag_write(
+                "Full-scan database not found (run a full C: scan first) — "
+                "skipping the full-scanner comparison."
+            )
+            return
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(db_path)
+            try:
+                total = conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(size),0) FROM items "
+                    "WHERE kind='File' AND category LIKE '%Temporary%'"
+                ).fetchone()
+                rows = conn.execute(
+                    "SELECT parent_path, COUNT(*), SUM(size) FROM items "
+                    "WHERE kind='File' AND category LIKE '%Temporary%' "
+                    "GROUP BY parent_path ORDER BY SUM(size) DESC LIMIT 50"
+                ).fetchall()
+            finally:
+                conn.close()
+
+            lines = [
+                "\nFull scan TEMPORARY/cache classification "
+                "(from the last full C: scan):"
+            ]
+            if total and int(total[1] or 0):
+                lines.append(
+                    f"  files: {int(total[0] or 0):,}  "
+                    f"size: {format_size(int(total[1]))}"
+                )
+            if rows:
+                lines.append("  top TEMPORARY locations by size:")
+                for parent, count, size in rows:
+                    lines.append(
+                        f"    {format_size(int(size or 0)):>11}  "
+                        f"{int(count or 0):>8,} files  "
+                        f"{parent or '(drive root)'}"
+                    )
+            else:
+                lines.append(
+                    "  no TEMPORARY files recorded in the last scan."
+                )
+            self._diag_write("\n".join(lines))
+        except Exception as exc:
+            self._diag_write(f"Full-scan comparison failed: {exc}")
+
+    def run(self):
+        try:
+            self._collect_classifier_stats = True
+            self.progress.emit("Discovering cache/temp locations...")
+            self.allowed_roots = self._find_allowed_roots()
+            self._log_roots()
+            self._diagnose_full_scan()
+
+            for root in self.allowed_roots:
+                if self.cancel_requested:
+                    break
+                self._scan_directory(root)
+
+            self._emit_update(force=True)
+
+            self._diag_write(
+                f"\nQuick Cleanup summary:\n"
+                f"  roots scanned: {len(self.allowed_roots)}\n"
+                f"  files examined: {self.scanned:,}\n"
+                f"  cache/temp candidates: {self.found:,}\n"
+                f"  total candidate size: {format_size(self.candidate_size)}\n"
+                f"  files classified TEMPORARY by full classifier: "
+                f"{self.classifier_temp_files:,}\n"
+                f"  cleaned: {self.cleaned:,}\n"
+                f"  skipped: {self.skipped:,}\n"
+                f"  failed: {self.failed:,}\n"
+                f"  space freed: {format_size(self.freed)}"
+            )
+
+            self.finished.emit(
+                self.scanned,
+                self.found,
+                self.cleaned,
+                self.skipped,
+                self.failed,
+                self.freed,
+            )
+        except Exception as error:
+            self.error.emit(str(error))
 
 
 # ============================================================
@@ -1059,6 +1714,12 @@ class MainWindow(QMainWindow):
 
         self.thread = None
         self.worker = None
+        self.cleanup_thread = None
+        self.cleanup_worker = None
+        self.cleanup_dialog = None
+        self.quick_cleanup_thread = None
+        self.quick_cleanup_worker = None
+        self.quick_cleanup_dialog = None
 
         self.scan_status = "not started"
 
@@ -1318,6 +1979,26 @@ class MainWindow(QMainWindow):
 
         side_layout.addWidget(
             self.smart_cleanup_button
+        )
+
+        self.quick_cleanup_button = QPushButton(
+            "Quick Cache & Temp Clean"
+        )
+
+        self.quick_cleanup_button.setObjectName(
+            "secondaryButton"
+        )
+
+        self.quick_cleanup_button.setToolTip(
+            "Quickly clean safe temporary and cache files only."
+        )
+
+        self.quick_cleanup_button.clicked.connect(
+            self.open_quick_cleanup
+        )
+
+        side_layout.addWidget(
+            self.quick_cleanup_button
         )
 
         self.export_button = QPushButton(
@@ -2262,139 +2943,85 @@ class MainWindow(QMainWindow):
         self._perform_smart_cleanup(selected_items)
 
     def _perform_smart_cleanup(self, items):
+        if self.cleanup_thread is not None:
+            return
 
-        moved = 0
-        failed = 0
-        skipped = 0
-        freed = 0
-
-        # Progress dialog
         progress_dialog = QDialog(self)
-        progress_dialog.setWindowTitle(
-            "DriveLens Smart Cleanup"
-        )
+        progress_dialog.setWindowTitle("DriveLens Smart Cleanup")
         progress_dialog.setModal(True)
-        progress_dialog.resize(600, 150)
-
-        dialog_layout = QVBoxLayout(
-            progress_dialog
+        progress_dialog.setWindowFlag(
+            Qt.WindowType.WindowCloseButtonHint,
+            False,
         )
+        progress_dialog.resize(620, 180)
 
-        progress_label = QLabel(
-            "Starting cleanup..."
-        )
-
+        dialog_layout = QVBoxLayout(progress_dialog)
+        progress_label = QLabel("Starting cleanup...")
         progress_label.setWordWrap(True)
-
         progress = QProgressBar()
-
-        progress.setRange(
-            0,
-            len(items),
-        )
-
+        progress.setRange(0, len(items))
         progress.setValue(0)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self._cancel_smart_cleanup)
 
-        dialog_layout.addWidget(
-            progress_label
-        )
+        dialog_layout.addWidget(progress_label)
+        dialog_layout.addWidget(progress)
+        dialog_layout.addWidget(cancel_button)
 
-        dialog_layout.addWidget(
-            progress
-        )
+        self.cleanup_dialog = progress_dialog
+        self.cleanup_dialog.progress_label = progress_label
+        self.cleanup_dialog.progress_bar = progress
+        self.cleanup_dialog.cancel_button = cancel_button
+
+        self.cleanup_worker = SmartCleanupWorker(items)
+        self.cleanup_thread = QThread(self)
+        self.cleanup_worker.moveToThread(self.cleanup_thread)
+        self.cleanup_thread.started.connect(self.cleanup_worker.run)
+        self.cleanup_worker.progress.connect(self._smart_cleanup_progress)
+        self.cleanup_worker.finished.connect(self._smart_cleanup_finished)
+        self.cleanup_worker.error.connect(self._smart_cleanup_error)
+        self.cleanup_worker.finished.connect(self.cleanup_thread.quit)
+        self.cleanup_worker.error.connect(self.cleanup_thread.quit)
+        self.cleanup_thread.finished.connect(self._smart_cleanup_thread_finished)
 
         progress_dialog.show()
+        self.cleanup_thread.start()
 
-        QApplication.processEvents()
-
-        for index, item in enumerate(
-            items,
-            start=1,
-        ):
-
-            path = item["path"]
-
-            progress_label.setText(
-                f"Moving {index:,} of {len(items):,}\n"
-                f"{path}"
-            )
-
-            progress.setValue(index - 1)
-
-            QApplication.processEvents()
-
-            # ---------------------------------------------
-            # FINAL SAFETY CHECK
-            # ---------------------------------------------
-
-            if item.get("is_protected", 0):
-                skipped += 1
-                continue
-
-            if item.get("can_delete") != "YES":
-                skipped += 1
-                continue
-
-            if item.get("kind") != "File":
-                skipped += 1
-                continue
-
-            if not os.path.exists(path):
-                skipped += 1
-                continue
-
-            try:
-
-                move_to_recycle_bin(path)
-
-                moved += 1
-
-                freed += int(
-                    item.get("size", 0) or 0
+    def _cancel_smart_cleanup(self):
+        if self.cleanup_worker is not None:
+            self.cleanup_worker.cancel()
+            if self.cleanup_dialog is not None:
+                self.cleanup_dialog.cancel_button.setEnabled(False)
+                self.cleanup_dialog.progress_label.setText(
+                    "Stopping after the current file operation finishes..."
                 )
 
-                # Remove successfully moved item
-                # from the current scan database.
-                try:
+    def _smart_cleanup_progress(self, index, total, path):
+        if self.cleanup_dialog is None:
+            return
+        self.cleanup_dialog.progress_label.setText(
+            f"Moving {index:,} of {total:,}\n{path}"
+        )
+        self.cleanup_dialog.progress_bar.setValue(index - 1)
 
-                    self.store.connection.execute(
-                        "DELETE FROM items WHERE id = ?",
-                        (item["id"],),
-                    )
-
-                except Exception:
-                    pass
-
-            except Exception:
-
-                failed += 1
-
-        # Commit database changes
-        try:
-
+    def _smart_cleanup_finished(self, moved, skipped, failed, freed, moved_ids):
+        if moved_ids:
+            placeholders = ",".join("?" for _ in moved_ids)
+            self.store.connection.execute(
+                f"DELETE FROM items WHERE id IN ({placeholders})",
+                tuple(moved_ids),
+            )
             self.store.connection.commit()
 
-        except Exception:
-            pass
+        if self.cleanup_dialog is not None:
+            self.cleanup_dialog.progress_bar.setValue(
+                self.cleanup_dialog.progress_bar.maximum()
+            )
+            self.cleanup_dialog.progress_label.setText("Cleanup complete.")
+            self.cleanup_dialog.close()
 
-        progress.setValue(
-            len(items)
-        )
-
-        progress_label.setText(
-            "Cleanup complete."
-        )
-
-        QApplication.processEvents()
-
-        progress_dialog.close()
-
-        self.details.show_item(
-            None
-        )
-
+        self.details.show_item(None)
         self.selected_item = None
-
         self._refresh_results()
 
         QMessageBox.information(
@@ -2404,178 +3031,211 @@ class MainWindow(QMainWindow):
                 f"Moved to Recycle Bin: {moved:,}\n"
                 f"Skipped: {skipped:,}\n"
                 f"Failed: {failed:,}\n\n"
-                f"Space selected: {format_size(freed)}\n\n"
-                "The files were moved to the Windows "
-                "Recycle Bin rather than permanently deleted."
+                f"Space selected/moved: {format_size(freed)}\n\n"
+                "The files were moved to the Windows Recycle Bin "
+                "rather than permanently deleted."
             ),
         )
 
-    def _perform_smart_cleanup_duplicate(
+    def _smart_cleanup_error(self, message):
+        if self.cleanup_dialog is not None:
+            self.cleanup_dialog.close()
+        QMessageBox.critical(
+            self,
+            "Smart Cleanup Failed",
+            f"Cleanup stopped before completion:\n\n{message}",
+        )
+
+    def _smart_cleanup_thread_finished(self):
+        if self.cleanup_thread is not None:
+            self.cleanup_thread.deleteLater()
+        self.cleanup_thread = None
+        self.cleanup_worker = None
+        self.cleanup_dialog = None
+
+    def open_quick_cleanup(self):
+        if self.quick_cleanup_thread is not None:
+            return
+
+        if self.thread is not None or self.cleanup_thread is not None:
+            QMessageBox.information(
+                self,
+                "Cleanup unavailable",
+                "Wait for the current scan or Smart Cleanup operation to finish.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("DriveLens — Quick Cache & Temp Clean")
+        dialog.setModal(True)
+        dialog.setWindowFlag(
+            Qt.WindowType.WindowCloseButtonHint,
+            False,
+        )
+        dialog.resize(620, 220)
+
+        layout = QVBoxLayout(dialog)
+        title = QLabel("Scanning temporary/cache files...")
+        title.setObjectName("panelTitle")
+        title.setWordWrap(True)
+        path_label = QLabel("Current path: —")
+        path_label.setWordWrap(True)
+        counts_label = QLabel(
+            "Scanned: 0    Found: 0    Cleaned: 0    "
+            "Skipped: 0    Failed: 0    Freed: 0 B"
+        )
+        counts_label.setWordWrap(True)
+        progress = QProgressBar()
+        progress.setRange(0, 0)
+        progress.setTextVisible(False)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self._cancel_quick_cleanup)
+
+        layout.addWidget(title)
+        layout.addWidget(path_label)
+        layout.addWidget(counts_label)
+        layout.addWidget(progress)
+        layout.addWidget(cancel_button)
+
+        self.quick_cleanup_dialog = dialog
+        self.quick_cleanup_dialog.title_label = title
+        self.quick_cleanup_dialog.path_label = path_label
+        self.quick_cleanup_dialog.counts_label = counts_label
+        self.quick_cleanup_dialog.cancel_button = cancel_button
+
+        self.quick_cleanup_worker = QuickCleanupWorker()
+        self.quick_cleanup_thread = QThread(self)
+        self.quick_cleanup_worker.moveToThread(
+            self.quick_cleanup_thread
+        )
+        self.quick_cleanup_thread.started.connect(
+            self.quick_cleanup_worker.run
+        )
+        self.quick_cleanup_worker.progress.connect(
+            self._quick_cleanup_progress
+        )
+        self.quick_cleanup_worker.counts.connect(
+            self._quick_cleanup_counts
+        )
+        self.quick_cleanup_worker.diagnostic.connect(
+            self._quick_cleanup_diagnostic
+        )
+        self.quick_cleanup_worker.root_stats.connect(
+            self._quick_cleanup_root_stats
+        )
+        self.quick_cleanup_worker.finished.connect(
+            self._quick_cleanup_finished
+        )
+        self.quick_cleanup_worker.error.connect(
+            self._quick_cleanup_error
+        )
+        self.quick_cleanup_worker.finished.connect(
+            self.quick_cleanup_thread.quit
+        )
+        self.quick_cleanup_worker.error.connect(
+            self.quick_cleanup_thread.quit
+        )
+        self.quick_cleanup_thread.finished.connect(
+            self._quick_cleanup_thread_finished
+        )
+
+        self.quick_cleanup_button.setEnabled(False)
+        self.scan_button.setEnabled(False)
+        dialog.show()
+        self.quick_cleanup_thread.start()
+
+    def _cancel_quick_cleanup(self):
+        if self.quick_cleanup_worker is not None:
+            self.quick_cleanup_worker.cancel()
+            if self.quick_cleanup_dialog is not None:
+                self.quick_cleanup_dialog.cancel_button.setEnabled(False)
+                self.quick_cleanup_dialog.title_label.setText(
+                    "Stopping after the current file operation finishes..."
+                )
+
+    def _quick_cleanup_progress(self, path):
+        if self.quick_cleanup_dialog is not None:
+            self.quick_cleanup_dialog.path_label.setText(
+                f"Current path: {path}"
+            )
+
+    def _quick_cleanup_counts(
         self,
-        items,
+        scanned,
+        found,
+        cleaned,
+        skipped,
+        failed,
+        freed,
     ):
-
-        moved = 0
-        failed = 0
-        skipped = 0
-        freed = 0
-
-        progress = QProgressBar(
-            self
-        )
-
-        progress.setWindowTitle(
-            "DriveLens Smart Cleanup"
-        )
-
-        progress.setRange(
-            0,
-            len(items),
-        )
-
-        progress.setValue(
-            0
-        )
-
-        # Use a small modal dialog to show progress
-        progress_dialog = QDialog(
-            self
-        )
-
-        progress_dialog.setWindowTitle(
-            "Cleaning selected files..."
-        )
-
-        progress_dialog.setModal(
-            True
-        )
-
-        dialog_layout = QVBoxLayout(
-            progress_dialog
-        )
-
-        progress_label = QLabel(
-            "Starting cleanup..."
-        )
-
-        dialog_layout.addWidget(
-            progress_label
-        )
-
-        dialog_layout.addWidget(
-            progress
-        )
-
-        progress_dialog.resize(
-            500,
-            130,
-        )
-
-        progress_dialog.show()
-
-        QApplication.processEvents()
-
-        for index, item in enumerate(
-            items,
-            start=1,
-        ):
-
-            path = item["path"]
-
-            progress_label.setText(
-                f"Moving {index:,} of "
-                f"{len(items):,}\n{path}"
+        if self.quick_cleanup_dialog is not None:
+            self.quick_cleanup_dialog.counts_label.setText(
+                f"Scanned: {scanned:,}    "
+                f"Found: {found:,}    "
+                f"Cleaned: {cleaned:,}    "
+                f"Skipped: {skipped:,}    "
+                f"Failed: {failed:,}    "
+                f"Freed: {format_size(freed)}"
             )
 
-            progress.setValue(
-                index - 1
+    def _quick_cleanup_diagnostic(self, message):
+        print(message)
+
+    def _quick_cleanup_root_stats(self, message):
+        print(message)
+
+    def _quick_cleanup_finished(
+        self,
+        scanned,
+        found,
+        cleaned,
+        skipped,
+        failed,
+        freed,
+    ):
+        if self.quick_cleanup_dialog is not None:
+            self.quick_cleanup_dialog.title_label.setText(
+                "Quick Cache & Temp Clean Complete"
             )
+            self.quick_cleanup_dialog.close()
 
-            QApplication.processEvents()
-
-            # Safety check again immediately before deletion
-            if item.get(
-                "is_protected",
-                0,
-            ):
-
-                skipped += 1
-                continue
-
-            try:
-
-                if not os.path.exists(
-                    path
-                ):
-
-                    skipped += 1
-                    continue
-
-                move_to_recycle_bin(
-                    path
-                )
-
-                moved += 1
-
-                freed += int(
-                    item.get(
-                        "size",
-                        0,
-                    )
-                    or 0
-                )
-
-                try:
-
-                    self.store.connection.execute(
-                        "DELETE FROM items WHERE id = ?",
-                        (item["id"],),
-                    )
-
-                except Exception:
-                    pass
-
-            except Exception:
-
-                failed += 1
-
-        try:
-
-            self.store.connection.commit()
-
-        except Exception:
-            pass
-
-        progress.setValue(
-            len(items)
+        self.status_label.setText(
+            "Quick Cache & Temp Clean complete"
         )
-
-        progress_label.setText(
-            "Cleanup complete."
-        )
-
-        QApplication.processEvents()
-
-        progress_dialog.close()
-
-        self.details.show_item(
-            None
-        )
-
-        self._refresh_results()
-
         QMessageBox.information(
             self,
-            "Smart Cleanup Complete",
+            "Quick Cache & Temp Clean Complete",
             (
-                f"Moved to Recycle Bin: {moved:,}\n"
+                f"Files scanned: {scanned:,}\n"
+                f"Cache/Temp files found: {found:,}\n"
+                f"Cleaned: {cleaned:,}\n"
                 f"Skipped: {skipped:,}\n"
-                f"Failed: {failed:,}\n\n"
-                f"Space selected: {format_size(freed)}\n\n"
-                "The files were moved to the Windows "
-                "Recycle Bin rather than permanently deleted."
+                f"Failed: {failed:,}\n"
+                f"Space freed: {format_size(freed)}\n\n"
+                "Files were moved to the Windows Recycle Bin "
+                "rather than permanently deleted."
             ),
         )
+
+    def _quick_cleanup_error(self, message):
+        if self.quick_cleanup_dialog is not None:
+            self.quick_cleanup_dialog.close()
+        QMessageBox.critical(
+            self,
+            "Quick Clean Failed",
+            f"Quick Cache & Temp Clean stopped:\n\n{message}",
+        )
+
+    def _quick_cleanup_thread_finished(self):
+        if self.quick_cleanup_thread is not None:
+            self.quick_cleanup_thread.deleteLater()
+        self.quick_cleanup_thread = None
+        self.quick_cleanup_worker = None
+        self.quick_cleanup_dialog = None
+        if hasattr(self, "quick_cleanup_button"):
+            self.quick_cleanup_button.setEnabled(True)
+        if self.thread is None:
+            self.scan_button.setEnabled(True)
 
     # ========================================================
     # EXPORT
@@ -2644,6 +3304,26 @@ class MainWindow(QMainWindow):
             self.thread.wait(
                 3000
             )
+
+        if self.cleanup_worker:
+
+            self.cleanup_worker.cancel()
+
+            if self.cleanup_thread:
+
+                self.cleanup_thread.wait(
+                    3000
+                )
+
+        if self.quick_cleanup_worker:
+
+            self.quick_cleanup_worker.cancel()
+
+            if self.quick_cleanup_thread:
+
+                self.quick_cleanup_thread.wait(
+                    3000
+                )
 
         self.store.close()
 

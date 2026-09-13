@@ -1,1 +1,2 @@
-& "D:\local\DriveLens-venv\Scripts\Activate.ps1"
+python -m venv DriveLens-venv(required to create a environment)
+& "D:\local\DriveLens-venv\Scripts\Activate.ps1"(to activitae the environment)
